@@ -1,0 +1,14 @@
+Checks: >-
+  -*,
+  bugprone-*,
+  clang-analyzer-*,
+  performance-*,
+  portability-*,
+  modernize-use-nullptr,
+  readability-braces-around-statements
+WarningsAsErrors: ''
+HeaderFilterRegex: '^(./)?(skiplist\.h|main\.cpp|stress-test/.*)$'
+FormatStyle: file
+CheckOptions:
+  - key: readability-braces-around-statements.ShortStatementLines
+    value: '0'

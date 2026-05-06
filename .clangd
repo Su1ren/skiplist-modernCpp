@@ -1,0 +1,28 @@
+CompileFlags:
+  CompilationDatabase: Ancestors
+
+Index:
+  Background: Build
+
+Diagnostics:
+  UnusedIncludes: None
+  ClangTidy:
+    Add:
+      - bugprone-*
+      - clang-analyzer-*
+      - performance-*
+      - portability-*
+      - modernize-use-nullptr
+      - readability-braces-around-statements
+    Remove:
+      - bugprone-easily-swappable-parameters
+
+Completion:
+  AllScopes: Yes
+  HeaderInsertion: Never
+
+InlayHints:
+  Enabled: Yes
+
+Hover:
+  ShowAKA: Yes
