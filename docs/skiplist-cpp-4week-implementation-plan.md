@@ -28,22 +28,154 @@
   - benchmark 日志污染和单线程默认值
 
 2. 建最小测试骨架
-- 新建一个轻量测试二进制，使用 `assert` 或自定义 `EXPECT_TRUE/EXPECT_EQ` 宏，不引入第三方框架。
-- 测试入口只做一件事：按 case 顺序运行并打印通过/失败摘要。
-- 测试覆盖当前行为，不急着引入新语义。
+- 目标不是一次性搭完整测试体系，而是先建立一个“每次改代码前后都能重复运行”的最小回归入口。
+- Week 1 采用单测试二进制方案，不引入 GoogleTest，不做多测试目标拆分，不做并行测试。
+- 建议目录结构如下：
+
+```text
+tests/
+├── test_main.cpp
+└── test_utils.h
+```
+
+- 第一版职责分工如下：
+  - `tests/test_main.cpp`
+    - 注册全部 case
+    - 按顺序执行 case
+    - 打印 `[PASS]` / `[FAIL]` 和最终 summary
+    - 根据通过数返回进程退出码
+  - `tests/test_utils.h`
+    - 放轻量断言宏，例如 `EXPECT_TRUE`、`EXPECT_FALSE`、`EXPECT_EQ`
+    - 放测试失败异常类型，例如 `TestFailure`
+    - 放少量通用辅助函数，例如 `reset_dump_file()`
+
+- 第一版测试入口约定：
+  - 每个 case 采用 `void test_xxx()` 形式。
+  - `main()` 中维护一个 `std::vector<TestCase>`，其中 `TestCase` 至少包含 `name` 和 `fn`。
+  - 每个 case 独立构造自己的 `SkipList<int, std::string>`，不复用对象实例。
+  - 发生断言失败时直接抛异常，由 `main()` 统一捕获并打印失败摘要。
+
+- 推荐最小断言宏：
+
+```cpp
+#define EXPECT_TRUE(cond) /* cond 为假时抛 TestFailure */
+#define EXPECT_FALSE(cond) EXPECT_TRUE(!(cond))
+#define EXPECT_EQ(lhs, rhs) /* lhs != rhs 时抛 TestFailure */
+```
+
+- 推荐最小运行输出格式：
+
+```text
+[PASS] insert_and_size
+[PASS] duplicate_insert_keeps_old_semantics
+[FAIL] dump_and_load_round_trip: EXPECT_EQ failed: ...
+
+Summary: 5/6 passed
+```
+
+- 第一版构建方式只需要满足“能稳定跑起来”，有两种可接受方案：
+  - 直接命令行编译：
+
+```bash
+g++ tests/test_main.cpp -o ./bin/tests -std=c++17 -pthread -I.
+./bin/tests
+```
+
+  - 或给 `makefile` 增加最小 `test` target：
+
+```make
+test: tests/test_main.cpp skiplist.h
+	$(CXX) $(CXXFLAGS) tests/test_main.cpp -o ./bin/tests
+	./bin/tests
+```
+
+- 由于当前实现把持久化路径写死为 `store/dumpFile`，Week 1 的测试骨架必须遵守两个限制：
+  - 所有测试串行执行，不做并发测试调度。
+  - 每个涉及持久化的 case 运行前先清空 `store/dumpFile`，避免 case 之间相互污染。
+
+- 当前阶段不要做的事：
+  - 不引入第三方测试框架。
+  - 不把测试拆成多个可执行文件。
+  - 不为日志输出写脆弱断言。
+  - 不在 Week 1 为了测试而大改生产代码接口。
 
 3. 先写“基线回归测试”
-- 插入唯一 key 后可查到，`size` 正确增长。
-- 重复 `insert_element` 保持当前语义：不覆盖，元素数不增长。
-- 删除存在 key 后不可查；删除不存在 key 不崩溃。
-- `dump_file` + `load_file` 能完成基本 round-trip。
-- 插入后 level0 结果有序。
-- 空表查询、空表删除、单元素表删除能正常返回。
+- 基线回归测试的目标是“冻结当前主路径行为”，不是提前引入未来新语义。
+- 第一批 case 建议固定为下面 6 个，命名也建议直接这样写：
+
+```text
+test_empty_search_and_delete_smoke
+test_insert_and_size
+test_duplicate_insert_keeps_old_semantics
+test_delete_existing_and_missing
+test_dump_and_load_round_trip
+test_level0_order_via_dump_file
+```
+
+- 这 6 个 case 的断言口径如下：
+  - `test_empty_search_and_delete_smoke`
+    - 新建空表。
+    - `search_element(任意 key)` 返回 `false`。
+    - `delete_element(任意 key)` 不崩溃。
+    - `size()` 仍为 `0`。
+  - `test_insert_and_size`
+    - 插入多个唯一 key。
+    - `insert_element` 返回成功值。
+    - `search_element` 可命中这些 key。
+    - `size()` 与成功插入次数一致。
+  - `test_duplicate_insert_keeps_old_semantics`
+    - 对同一个 key 连续插入两次。
+    - 第一次返回成功，第二次返回“已存在”。
+    - `size()` 不增长。
+    - 不要求断言 value 被覆盖，因为当前语义本来就是“不覆盖”。
+  - `test_delete_existing_and_missing`
+    - 插入若干 key。
+    - 删除一个存在的 key 后，`search_element` 返回 `false`。
+    - 删除一个不存在的 key 不崩溃，`size()` 不出现额外变化。
+  - `test_dump_and_load_round_trip`
+    - 先新建一个表，插入若干 key/value 并调用 `dump_file()`。
+    - 再新建第二个全新表，调用 `load_file()`。
+    - 第二个表应能查到刚才落盘的 key。
+    - 不要在同一个实例上直接 `dump_file()` 后再 `load_file()`，因为当前 `load_file()` 不是“清空后恢复”，而是“继续插入当前内存”。
+  - `test_level0_order_via_dump_file`
+    - 乱序插入若干 key。
+    - 调用 `dump_file()`。
+    - 直接读取 `store/dumpFile` 的行顺序。
+    - 断言文件中的 key 是升序。
+    - 这个 case 不依赖 `display_list()` 的标准输出格式，因为那部分输出在 P0 阶段很可能会被调整。
+
+- 如果还有余力，再补 2 个低成本 case：
+  - `test_single_element_delete`
+    - 插入一个 key，再删除它，验证表恢复为空。
+  - `test_load_file_on_empty_dump_file`
+    - 清空 `store/dumpFile` 后直接调用 `load_file()`，验证不崩溃。
+
+- 基线测试阶段刻意不去固化下面这些已知缺陷：
+  - 不为 `load_file()` 多次调用后的“混入行为”写正向断言。
+  - 不为无锁查询下的并发行为写通过性断言。
+  - 不为当前 `std::cout` 文本内容写精确匹配断言。
+
+- 这一阶段的核心原则是：
+  - 冻结主路径正确性。
+  - 不把明显设计缺陷误写成未来必须兼容的“正确行为”。
 
 4. 输出第一版工程约束
-- 本轮实现中，内存结构仍保持模板化。
-- 持久化路径先只支持 `K=int`、`V=std::string`。
-- 第 4 周前不做 SSTable / compaction / Bloom Filter。
+- Week 1 要写出一份可以约束后续改造范围的“工程红线”，避免第 2 周开始边改边变更目标。
+- 第一版工程约束建议明确写成下面 10 条：
+  - 内存中的跳表结构继续保持 `SkipList<K, V>` 模板形式，不在 Week 1 就把整个项目改成非模板版本。
+  - `main.cpp` 和现有 demo 行为必须继续可编译、可运行，不允许为了测试先打断 demo。
+  - Week 1 的测试目标是当前接口：`insert_element`、`delete_element`、`search_element`、`dump_file`、`load_file`、`size`，不提前引入 `put/get/erase/scan` 新接口。
+  - 当前重复 key 语义先保持不变：`insert_element` 遇到重复 key 返回失败，不覆盖旧值。
+  - 持久化测试先只覆盖 `K=int`、`V=std::string` 的路径，因为当前 `load_file()` 依赖 `stoi`。
+  - 当前硬编码持久化文件 `store/dumpFile` 先接受为临时约束，因此 Week 1 所有测试都必须串行执行，并在 case 间清理文件状态。
+  - Week 1 不修改 benchmark 模型，不把 `stress_test.cpp` 重写成新 harness。
+  - Week 1 不引入 WAL、checkpoint、SSTable、compaction、Bloom Filter 等新存储层概念。
+  - Week 1 不把日志输出文本视为对外稳定接口，因此测试不对 `std::cout` 具体文案做强绑定。
+  - Week 1 允许在 `makefile` 中新增最小 `test` target，但不做大规模构建系统重构。
+
+- 建议把这份工程约束整理成仓库内一段固定文字，后续每周开始前先对照一次，确认：
+  - 哪些是 Week 1 故意冻结的旧语义。
+  - 哪些是 Week 2 / Week 3 明确要突破的边界。
 
 ### 本周完成标准
 - 你能不看代码讲清 `update[]`、`_skip_list_level`、`get_random_level`。

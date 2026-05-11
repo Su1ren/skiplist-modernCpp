@@ -226,14 +226,18 @@ sh stress_test_start.sh
 
 ## 最终阅读产物
 
-完成这一轮阅读后，你至少要整理出下面 6 份材料：
+完成这一轮阅读后，你至少要整理出下面 10 份材料：
 
-1. 一页项目结构概览。
-2. 插入、查询、删除三张路径图。
-3. 一份当前持久化流程图。
-4. 一份当前并发模型说明。
-5. 一份当前代码缺陷清单。
-6. 一份 3 分钟项目讲稿。
+1. [一页项目结构概览](./skiplist-project-structure-overview.md)。
+2. [插入、查询、删除三张路径图](./skiplist-operation-path-diagrams.md)。
+3. [一份当前持久化流程图](./skiplist-persistence-flow.md)。
+4. [一份当前并发模型和问题清单](./skiplist-concurrency-model-and-issue-list.md)。
+5. [一份当前代码缺陷清单](./skiplist-code-defect-list.md)。
+6. [一份 benchmark 局限性清单](./skiplist-benchmark-limitations.md)。
+7. [一份 3 分钟项目讲稿](./skiplist-3minute-project-talk.md)。
+8. [一份当前持久化缺陷清单](./skiplist-persistence-defect-list.md)。
+9. [一份资源生命周期笔记](./skiplist-resource-lifecycle-notes.md)。
+10. [一份内存管理风险清单](./skiplist-memory-management-risk-list.md)。
 
 ## 你读完后应当能直接说出的结论
 
