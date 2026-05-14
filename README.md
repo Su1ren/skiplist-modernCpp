@@ -88,9 +88,9 @@ sh stress_test_start.sh
 * 跳表的key用int型，如果使用其他类型需要自定义比较函数，当然把这块抽象出来更好
 * 如果再加上一致性协议，例如raft就构成了分布式存储，再启动一个http server就可以对外提供分布式存储服务了
 
-# 关于作者
+# 原始作者
 
-大家好，我是程序员Carl，[《代码随想录》](https://programmercarl.com/other/publish.html)作者，哈工大师兄，先后在腾讯和百度从事分布式技术研发。
+程序员Carl，[《代码随想录》](https://programmercarl.com/other/publish.html)作者，哈工大师兄，先后在腾讯和百度从事分布式技术研发。
 
 * [代码随想录网站](https://programmercarl.com)
 * [代码随想录Github](https://github.com/youngyangyang04/leetcode-master)

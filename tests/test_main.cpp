@@ -2,9 +2,11 @@
 #include "test_utils.h"
 
 #include <fstream>
+#include <atomic>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 #include <array>
 #include <cstdio>
@@ -133,6 +135,9 @@ void test_duplicate_insert_keeps_old_semantics() {
     EXPECT_EQ(skip_list.insert_element(7, "second"), 1);
     EXPECT_TRUE(skip_list.search_element(7));
     EXPECT_EQ(skip_list.size(), 1);
+    const IntStringSkipList& read_view = skip_list;
+    EXPECT_TRUE(read_view.get(7).has_value());
+    EXPECT_EQ(read_view.get(7).value(), "first");
 }
 
 void test_delete_existing_and_missing() {
@@ -360,10 +365,181 @@ void test_iterative_destructor_stress() {
     EXPECT_TRUE(true);
 }
 
+void test_put_returns_inserted_then_updated_and_get_returns_latest_value() {
+    reset_dump_file();
+    IntStringSkipList skip_list(6);
+    const IntStringSkipList& read_view = skip_list;
+
+    EXPECT_EQ(skip_list.put(42, "first"), WriteResult::inserted);
+    EXPECT_EQ(skip_list.put(42, "second"), WriteResult::updated);
+    EXPECT_TRUE(read_view.get(42).has_value());
+    EXPECT_EQ(read_view.get(42).value(), "second");
+    EXPECT_EQ(read_view.size(), static_cast<size_t>(1));
+}
+
+void test_contains_erase_and_size_main_api() {
+    reset_dump_file();
+    IntStringSkipList skip_list(6);
+    const IntStringSkipList& read_view = skip_list;
+
+    EXPECT_FALSE(read_view.contains(10));
+    EXPECT_EQ(skip_list.put(10, "ten"), WriteResult::inserted);
+    EXPECT_EQ(skip_list.put(20, "twenty"), WriteResult::inserted);
+    EXPECT_TRUE(read_view.contains(10));
+    EXPECT_TRUE(read_view.contains(20));
+    EXPECT_EQ(read_view.size(), static_cast<size_t>(2));
+
+    EXPECT_TRUE(skip_list.erase(10));
+    EXPECT_FALSE(read_view.contains(10));
+    EXPECT_TRUE(read_view.contains(20));
+    EXPECT_EQ(read_view.size(), static_cast<size_t>(1));
+    EXPECT_FALSE(skip_list.erase(999));
+}
+
+void test_scan_returns_sorted_half_open_range() {
+    reset_dump_file();
+    IntStringSkipList skip_list(8);
+    const IntStringSkipList& read_view = skip_list;
+
+    EXPECT_EQ(skip_list.put(30, "thirty"), WriteResult::inserted);
+    EXPECT_EQ(skip_list.put(10, "ten"), WriteResult::inserted);
+    EXPECT_EQ(skip_list.put(20, "twenty"), WriteResult::inserted);
+    EXPECT_EQ(skip_list.put(40, "forty"), WriteResult::inserted);
+
+    const auto result = read_view.scan(15, 35);
+    EXPECT_EQ(result.size(), static_cast<size_t>(2));
+    EXPECT_EQ(result[0].first, 20);
+    EXPECT_EQ(result[0].second, "twenty");
+    EXPECT_EQ(result[1].first, 30);
+    EXPECT_EQ(result[1].second, "thirty");
+}
+
+void test_concurrent_put_smoke() {
+    reset_dump_file();
+    IntStringSkipList skip_list(12);
+    const IntStringSkipList& read_view = skip_list;
+
+    constexpr int kThreads = 4;
+    constexpr int kPerThreadKeys = 250;
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+
+    for (int tid = 0; tid < kThreads; ++tid) {
+        threads.emplace_back([&, tid]() {
+            const int start = tid * kPerThreadKeys;
+            const int end = start + kPerThreadKeys;
+            for (int key = start; key < end; ++key) {
+                const WriteResult result = skip_list.put(key, "v" + std::to_string(key));
+                EXPECT_EQ(result, WriteResult::inserted);
+            }
+        });
+    }
+
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+
+    EXPECT_EQ(read_view.size(), static_cast<size_t>(kThreads * kPerThreadKeys));
+    for (int key = 0; key < kThreads * kPerThreadKeys; ++key) {
+        EXPECT_TRUE(read_view.contains(key));
+    }
+}
+
+void test_concurrent_get_smoke() {
+    reset_dump_file();
+    IntStringSkipList skip_list(12);
+    const IntStringSkipList& read_view = skip_list;
+
+    constexpr int kKeys = 1000;
+    for (int key = 0; key < kKeys; ++key) {
+        EXPECT_EQ(skip_list.put(key, "seed"), WriteResult::inserted);
+    }
+
+    constexpr int kThreads = 4;
+    constexpr int kRepeats = 500;
+    std::atomic<int> misses{0};
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+
+    for (int tid = 0; tid < kThreads; ++tid) {
+        threads.emplace_back([&, tid]() {
+            for (int repeat = 0; repeat < kRepeats; ++repeat) {
+                for (int key = tid; key < kKeys; key += kThreads) {
+                    if (!read_view.get(key).has_value()) {
+                        misses.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+        });
+    }
+
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+
+    EXPECT_EQ(misses.load(), 0);
+    EXPECT_EQ(read_view.size(), static_cast<size_t>(kKeys));
+}
+
+void test_concurrent_mixed_smoke() {
+    reset_dump_file();
+    IntStringSkipList skip_list(12);
+    const IntStringSkipList& read_view = skip_list;
+
+    constexpr int kWriterThreads = 2;
+    constexpr int kReaderThreads = 2;
+    constexpr int kKeysPerWriter = 300;
+    constexpr int kTotalKeys = kWriterThreads * kKeysPerWriter;
+    constexpr int kReadIterations = 4000;
+
+    std::atomic<bool> start{false};
+    std::atomic<int> reader_steps{0};
+    std::vector<std::thread> threads;
+    threads.reserve(kWriterThreads + kReaderThreads);
+
+    for (int tid = 0; tid < kWriterThreads; ++tid) {
+        threads.emplace_back([&, tid]() {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            const int start_key = tid * kKeysPerWriter;
+            const int end_key = start_key + kKeysPerWriter;
+            for (int key = start_key; key < end_key; ++key) {
+                skip_list.put(key, "v" + std::to_string(key));
+            }
+        });
+    }
+
+    for (int tid = 0; tid < kReaderThreads; ++tid) {
+        threads.emplace_back([&, tid]() {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            for (int i = 0; i < kReadIterations; ++i) {
+                const int key = (i + tid) % kTotalKeys;
+                (void)read_view.get(key);
+                reader_steps.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+
+    start.store(true, std::memory_order_release);
+
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+
+    EXPECT_TRUE(reader_steps.load() > 0);
+    EXPECT_EQ(read_view.size(), static_cast<size_t>(kTotalKeys));
+    for (int key = 0; key < kTotalKeys; ++key) {
+        EXPECT_TRUE(read_view.contains(key));
+    }
+}
+
 }  // namespace
 
 int main() {
-    constexpr std::array<TestCase, 13> test_cases = {{
+    constexpr std::array<TestCase, 19> test_cases = {{
         {"test_empty_search_and_delete_smoke", test_empty_search_and_delete_smoke},
         {"test_insert_and_size", test_insert_and_size},
         {"test_duplicate_insert_keeps_old_semantics", test_duplicate_insert_keeps_old_semantics},
@@ -378,6 +554,13 @@ int main() {
          test_two_instances_with_different_snapshot_paths_do_not_interfere},
         {"test_display_list_writes_to_provided_stream_only", test_display_list_writes_to_provided_stream_only},
         {"test_iterative_destructor_stress", test_iterative_destructor_stress},
+        {"test_put_returns_inserted_then_updated_and_get_returns_latest_value",
+         test_put_returns_inserted_then_updated_and_get_returns_latest_value},
+        {"test_contains_erase_and_size_main_api", test_contains_erase_and_size_main_api},
+        {"test_scan_returns_sorted_half_open_range", test_scan_returns_sorted_half_open_range},
+        {"test_concurrent_put_smoke", test_concurrent_put_smoke},
+        {"test_concurrent_get_smoke", test_concurrent_get_smoke},
+        {"test_concurrent_mixed_smoke", test_concurrent_mixed_smoke},
     }};
 
     int passed = 0;

@@ -13,11 +13,13 @@
 #include <cstring>
 #include <mutex>
 #include <fstream>
+#include <optional>
 #include <vector>
 #include <memory>
 #include <shared_mutex>
 #include <cassert>
 #include <type_traits>
+#include <cstdint>
 
 // #define STORE_FILE "store/dumpFile" // 定义持久化文件路径
 
@@ -136,7 +138,29 @@ struct persistence_supported<int, std::string> : std::true_type {}; // int 和 s
 
 // 定义一个 constexpr 变量，方便在代码中检查是否支持持久化。
 template <typename K, typename V>
-inline constexpr bool is_persistence_supported_v = persistence_supported<K, V>::value; 
+inline constexpr bool is_persistence_supported_v = persistence_supported<K, V>::value;
+
+enum class WriteResult : uint8_t {
+    inserted, // 表示新元素被成功插入
+    updated,  // 表示已有元素的值被更新
+};
+
+inline const char* to_string(WriteResult result) {
+    switch (result) {
+        case WriteResult::inserted:
+            return "inserted";
+        case WriteResult::updated:
+            return "updated";
+        default:
+            return "unknown";
+    }
+}
+
+inline std::ostream& operator<<(std::ostream& os, WriteResult result) {
+    os << to_string(result);
+    return os;
+}
+
 
 // Class template for Skip list
 // 跳表模板类
@@ -159,7 +183,23 @@ public:
     // void clear(Node<K,V>*); // 递归删除跳表中的节点
     int size(); // 获取跳表中元素的数量
 
+    // 以下为新主接口，旧 API 只做兼容，最终会废弃。
+    size_t size() const; // 新主接口，获取跳表中元素的数量，线程安全
+    std::optional<V> get(const K &key) const; // 新主接口，获取指定键的值，线程安全
+    bool contains(const K &key) const;        // 新主接口，检查跳表中是否包含指定键，线程安全
+    bool erase(const K &key);                 // 新主接口，删除指定键的元素，线程安全
+    std::vector<std::pair<K, V>> scan(const K &start_key,
+                                      const K &end_key) const; // 新主接口，范围查询，线程安全
+    bool checkpoint(); // 新主接口，执行一次全量持久化，将当前跳表状态保存到文件中，线程安全
+    bool recover();    // 新主接口，从持久化文件中恢复跳表状态，线程安全
+    WriteResult put(const K &key, const V &value); // 新主接口，插入或更新元素，线程安全，返回写入结果（inserted 或 updated）
+
 private:
+    std::optional<V> get_unlocked(const K &key) const;
+    WriteResult put_unlocked(const K &key, const V &value, bool update_existing);
+    bool erase_unlocked(const K &key);
+    void dump_file_unlocked();
+    void load_file_unlocked();
     void get_key_value_from_string(const std::string& str, std::string* key, std::string* value); // 从字符串中提取键值对
     bool is_valid_string(const std::string& str); // 判断字符串是否有效，是否包含键值对分隔符
 
@@ -205,7 +245,7 @@ private:
     int _element_count;
 
     // 设定为成员的互斥锁，保护跳表的修改操作，确保线程安全。
-    std::shared_mutex mtx; // 读写锁，允许多个线程同时读取，但在写入时独占锁。
+    mutable std::shared_mutex mtx_; // 全表级读写锁，允许多个线程同时读取，但在写入时独占锁，提升并发性能。
 };
 
 // create new node
@@ -255,97 +295,20 @@ int SkipList<K, V>::insert_element(const K key, const V value) {
      * @param value：要插入节点的值。
      * @return int：返回 1 表示元素已存在，返回 0 表示插入成功。
      */
-    // 对跳表进行修改操作，使用互斥锁保护临界区，确保线程安全。
-    mtx.lock();
-    // 从头节点开始，查找插入位置。current 指针用于遍历跳表，初始指向头节点。
-    Node<K, V> *current = this->_header;
 
-    // create update array and initialize it
-    // update is array which put node that the node->forward[i] should be operated later
-    // 用一个 Node* 数组记录每一层需要调整的节点位置，update[i] 指向第 i 层上需要调整的节点。大小为 max_level + 1，层数从 0 开始。
-    // 用于插入节点后，调整各个层级上的 forward 指针，使新节点正确链接到跳表中。
-    Node<K, V> *update[_max_level + 1];
-    // 初始化 update 数组，所有元素初始为 nullptr。
-    // memset(update, NULL, sizeof(Node<K, V>*)*(_max_level + 1));
-    std::fill_n(update, _max_level + 1, nullptr);
-
-    // start form highest level of skip list
-    // 从最高层开始，逐层向下查找插入位置
-    // 如果是从最底层开始，则复杂度为 O(n)，如果从最高层开始，则平均复杂度为 O(log n)，因为每层的节点数量大约是下一层的一半。
-    for (int i = _skip_list_level; i >= 0; i--) {
-        // 从当前节点开始，沿着第 i 层的 forward 指针向右移动
-        // 如果下一个节点存在且其键小于要插入的键，则继续向右移动
-        // 直到找到第 i 层上第一个键大于或等于要插入键的节点。
-        while (current->forward[i] != nullptr && current->forward[i]->get_key() < key) {
-            current = current->forward[i];
-        } // 此时 current 指向第 i 层上最后一个键小于要插入键的节点，current->forward[i] 是第 i 层上第一个键大于或等于要插入键的节点。
-        // 记录第 i 层上需要调整的节点位置，即 current 节点
-        // 新节点将插入在 current 和 current->forward[i] 之间
-        // 最后 update 中的节点需要调整 forward 指针，使新节点正确链接到跳表中。
-        update[i] = current;
-    }
-
-    // reached level 0 and forward pointer to right node, which is desired to insert key.
-    // 到达第 0 层，current->forward[0] 是第 0 层上第一个键大于或等于要插入键的节点。
-    current = current->forward[0];
-
-    // if current node have key equal to searched key, we get it
-    // 若 current 不为空，而且 current 的键等于要插入的键，说明该键已经存在于跳表中。
-    // 插入失败，返回 1。
-    if (current != nullptr && current->get_key() == key) {
-        mtx.unlock();
-        return 1;
-    }
-
-    // if current is NULL that means we have reached to end of the level
-    // if current's key is not equal to key that means we have to insert node between update[0] and current node
-    // 若 current 的 key 不等于要插入的 key，说明 current 是第 0 层上第一个键大于要插入键的节点
-    // 或者 current 是 nullptr，说明到达了第 0 层的末尾。
-    // 此时需要在 update[0] 和 current 之间插入新节点。
-    if (current == nullptr || current->get_key() != key ) {
-
-        // Generate a random level for node
-        // 为插入的新节点随机生成 level
-        // 这是跳表的核心机制之一，通过随机层数来实现平均 O(log n) 的搜索效率。
-        // 随机层数使得跳表的结构保持平衡，避免节点删除后性能退化为 O(n)。
-        int random_level = get_random_level();
-
-        // If random level is greater thar skip list's current level, initialize update value with pointer to header
-        // 如果随机生成的层数 random_level 大于当前跳表的实际层数 _skip_list_level，
-        // 说明新节点需要插入到更高的层级上，此时需要将 update 数组中从 _skip_list_level + 1 到 random_level 的元素都指向头节点 _header
-        // 以便在后续插入节点时正确调整这些层级上的 forward 指针。
-        // 实际上是新建了一些层级，并将这些层级的头节点指针指向 _header。
-        if (random_level > _skip_list_level) {
-            for (int i = _skip_list_level + 1; i < random_level + 1; i++) {
-                update[i] = _header;
-            }
-            // 更新跳表的实际层数为 random_level，因为新节点需要插入到这个层级上。
-            _skip_list_level = random_level;
-        }
-
-        // create new node with random level generated
-        // 创建新节点，参数为要插入的键、值和随机生成的层数。
-        Node<K, V>* inserted_node = create_node(key, value, random_level);
-
-        // insert node
-        // 将节点插入到跳表中，调整各层级上的 forward 指针，使新节点正确链接到跳表中。
-        for (int i = 0; i <= random_level; i++) {
-            // 调整新节点的 forward 指针，使其指向 update[i] 的下一个节点，即 current。
-            inserted_node->forward[i] = update[i]->forward[i];
-            // 将 update 中的节点的 forward 指针调整为指向新节点 inserted_node。
-            update[i]->forward[i] = inserted_node;
-        }
-        _element_count++;
-    }
-    // 插入结束，释放锁，返回 0 表示插入成功。
-    mtx.unlock();
-    return 0;
+    std::unique_lock<std::shared_mutex> lock(mtx_);
+    return put_unlocked(key, value, false) == WriteResult::inserted ? 0 : 1;
 }
 
-// Display skip list 
-template<typename K, typename V> 
-void SkipList<K, V>::display_list(std::ostream& os) const {
-
+// Display skip list
+template <typename K, typename V> void SkipList<K, V>::display_list(std::ostream &os) const {
+    /**
+     * @brief 显示跳表内容
+     * @details 从最高层开始，逐层打印跳表中的节点信息，每层显示节点的键值对。
+     * @param os：输出流对象，默认为 std::cout，可以指定其他输出流，例如文件流。
+     * @note 读路径，需要加共享锁，确保在读取跳表内容时不会被修改，保持数据一致性。
+     */
+    std::shared_lock<std::shared_mutex> lock(mtx_); // 读路径加共享锁，允许多个线程同时读取，但在写入时独占锁，提升并发性能。
     os << "\n*****Skip List*****"<<"\n"; 
     for (int i = 0; i <= _skip_list_level; i++) {
         Node<K, V> *node = this->_header->forward[i]; 
@@ -369,18 +332,8 @@ template <typename K, typename V> void SkipList<K, V>::dump_file() {
     // 检查约束条件，确保当前 SkipList 的键值类型支持持久化。
     static_assert(is_persistence_supported_v<K, V>, "Current key-value types do not support persistence in dump_file.");
     
-    _file_writer.open(_store_file);
-    // 按照第 0 层的节点顺序遍历跳表，将每个节点的键值对写入文件中。
-    Node<K, V> *node = this->_header->forward[0]; 
-
-    while (node != nullptr) {
-        _file_writer << node->get_key() << ":" << node->get_value() << "\n";
-        node = node->forward[0];
-    }
-    // 写入完成后，刷新缓冲区并关闭文件。
-    _file_writer.flush();
-    _file_writer.close();
-    return ;
+    std::shared_lock<std::shared_mutex> lock(mtx_);
+    dump_file_unlocked();
 }
 
 // Load data from disk
@@ -393,32 +346,14 @@ template <typename K, typename V> void SkipList<K, V>::load_file() {
     static_assert(is_persistence_supported_v<K, V>,
                   "Current key-value types do not support persistence in load_file.");
     
-    _file_reader.open(_store_file);
-    // 每次读取一行数据，解析出键值对，并调用 insert_element 将其插入到跳表中。
-    std::string line;
-    // 使用两个 std::string 变量 key 和 value 来存储解析出的键和值，避免在循环中频繁创建和销毁字符串对象，提高性能。
-    std::string* key = new std::string();
-    std::string* value = new std::string();
-    while (getline(_file_reader, line)) {
-        // 从读取的行中提取键值对，存储在 key 和 value 中。
-        get_key_value_from_string(line, key, value);
-        if (key->empty() || value->empty()) {
-            continue;
-        }
-        // Define key as int type
-        // 限定键的类型为 int，调用 insert_element 将键值对插入到跳表中。
-        // 所以当模板是半泛型时，键必须是 int 类型，否则会导致编译错误。
-        insert_element(stoi(*key), *value);
-    }
-    delete key;
-    delete value;
-    _file_reader.close();
+    std::unique_lock<std::shared_mutex> lock(mtx_);
+    load_file_unlocked();
 }
 
 // Get current SkipList size
 template<typename K, typename V> 
 int SkipList<K, V>::size() { 
-    return _element_count;
+    return static_cast<int>(static_cast<const SkipList<K, V>&>(*this).size());
 }
 
 template <typename K, typename V>
@@ -463,60 +398,7 @@ void SkipList<K, V>::delete_element(K key) {
      * @param key：要删除的键
      * @details 先找到要删除的节点，记录需要调整的节点位置，然后调整 forward 指针完成删除，最后更新跳表的实际层数和元素数量。
      */
-    // 先锁定跳表，确保线程安全。
-    mtx.lock();
-    Node<K, V> *current = this->_header;
-    // 记录每一层需要调整的节点位置，update[i] 指向第 i 层上需要调整的节点。
-    // 大小为 max_level + 1，层数从 0 开始。
-    Node<K, V> *update[_max_level + 1];
-    // memset(update, NULL, sizeof(Node<K, V>*)*(_max_level + 1));
-    std::fill_n(update, _max_level + 1, nullptr);
-
-    // start from highest level of skip list
-    // 类似于查找节点的过程，从最高层开始，逐层向下查找要删除的节点。
-    for (int i = _skip_list_level; i >= 0; i--) {
-        while (current->forward[i] != nullptr && current->forward[i]->get_key() < key) {
-            current = current->forward[i];
-        }
-        // 记录第 i 层上需要调整的节点位置，即 current 节点
-        update[i] = current;
-    }
-    // 最后一层，current->forward[0] 是第 0 层上第一个键大于或等于要删除键的节点。
-    // current 是要删除的节点的前一个节点，current->forward[0] 是要删除的节点
-    // 或者第 0 层上第一个键大于要删除键的节点。
-    current = current->forward[0];
-
-    // 待删除的节点存在，调整各层级上的 forward 指针，完成删除。
-    if (current != nullptr && current->get_key() == key) {
-
-        // start for lowest level and delete the current node of each level
-        // 从最低层开始，调整每一层级上的 forward 指针，使其跳过当前节点 current，
-        // 指向 current 的下一个节点。
-        for (int i = 0; i <= _skip_list_level; i++) {
-
-            // if at level i, next node is not target node, break the loop.
-            // 如果第 i 层上 current->forward[i] 不等于当前需要删除的节点 current
-            // 说明在第 i 层上已经没有 current，更高层也不可能有 current 节点了，直接跳出循环。
-            if (update[i]->forward[i] != current) { 
-                break;
-            }
-            // 将 update 的 forward 指针调整为指向 current 的下一个节点
-            // 即 current->forward[i]，完成逻辑删除。
-            update[i]->forward[i] = current->forward[i];
-        }
-
-        // Remove levels which have no elements
-        // 删除节点后，可能产生没有节点的层级，此时需要调整跳表的实际层数 _skip_list_level。
-        while (_skip_list_level > 0 && _header->forward[_skip_list_level] == nullptr) {
-            _skip_list_level--; 
-        }
-
-        // 最后删除 current 节点，释放内存，并更新元素数量。
-        delete current;
-        _element_count--;
-    }
-    mtx.unlock();
-    return;
+    erase(key);
 }
 
 // Search for element in skip list 
@@ -546,29 +428,7 @@ bool SkipList<K, V>::search_element(K key) {
      * @return 如果找到返回 true，否则返回 false
      * @note 读取过程中没有加锁，如果并发修改跳表，可能会导致读取到不一致的数据，后续改进可以使用读写锁来实现更细粒度的锁定，允许多个线程同时读取，但在写入时独占锁。
      */
-
-    // 从头节点开始查找，current 指针用于遍历跳表，初始指向头节点。
-    Node<K, V> *current = _header;
-
-    // start from highest level of skip list
-    // 同插入节点相同，都从最高层开始，逐层向下查找目标节点。
-    for (int i = _skip_list_level; i >= 0; i--) {
-        while (current->forward[i] && current->forward[i]->get_key() < key) {
-            current = current->forward[i];
-        }
-    }
-
-    // reached level 0 and advance pointer to right node, which we search
-    // 到达第 0 层，current->forward[0] 是第 0 层上第一个键大于或等于要搜索键的节点。
-    current = current->forward[0];
-
-    // if current node have key equal to searched key, we get it
-    // 已经存在节点，返回 true
-    if (current && current->get_key() == key) {
-        return true;
-    }
-    // 找不到节点，返回 false
-    return false;
+    return contains(key);
 }
 
 template <typename K, typename V>
@@ -713,4 +573,249 @@ std::string SkipList<K, V>::unescape_value(const std::string &value) {
     }
     return unescaped_value;
 }
+
+template <typename K, typename V>
+size_t SkipList<K, V>::size() const {
+    /**
+     * @brief 获取跳表中元素的数量
+     * @return 跳表中元素的数量
+     * @details 通过访问成员变量 _element_count 获取当前跳表中元素的数量。
+     * @note 由于 _element_count 是在插入和删除操作中更新的，因此在读取时需要加锁以确保线程安全。
+     */
+    // 读取方法，用共享锁
+    std::shared_lock lock(mtx_);
+    return _element_count;
+}
+
+template <typename K, typename V>
+std::optional<V> SkipList<K, V>::get_unlocked(const K &key) const {
+    Node<K, V> *current = _header;
+    for (int i = _skip_list_level; i >= 0; --i) {
+        while (current->forward[i] && current->forward[i]->get_key() < key) {
+            current = current->forward[i];
+        }
+    }
+    current = current->forward[0];
+    if (current && current->get_key() == key) {
+        return current->get_value();
+    }
+    return std::nullopt;
+}
+
+template <typename K, typename V> std::optional<V> SkipList<K, V>::get(const K &key) const {
+    /**
+     * @brief 获取指定键的值
+     * @param key：要获取值的键
+     * @return std::optional<V>：如果找到返回包含值的 std::optional，否则返回 std::nullopt
+     * @details 通过在跳表中搜索指定键，找到对应的节点并返回其值。如果找不到，则返回 std::nullopt。
+     * @note 读取方法，用共享锁
+     */
+    std::shared_lock lock(mtx_);
+    return get_unlocked(key);
+}
+
+template <typename K, typename V> bool SkipList<K, V>::contains(const K &key) const {
+    /**
+     * @brief 检查跳表中是否包含指定键
+     * @param key：要检查的键
+     * @return bool：如果包含返回 true，否则返回 false
+     * @details 通过在跳表中搜索指定键，判断是否存在对应的节点来确定是否包含该键。
+     * @note 读取方法，用共享锁
+     */
+    std::shared_lock lock(mtx_);
+    return get_unlocked(key).has_value();
+}
+
+template <typename K, typename V> bool SkipList<K, V>::erase_unlocked(const K &key) {
+    /**
+     * @brief 删除指定键的元素
+     * @param key：要删除的键
+     * @return bool：如果删除成功返回 true，否则返回 false
+     * @details 通过在跳表中搜索指定键，找到对应的节点并删除它。如果找不到，则返回 false。
+     * @note 写入方法，用独占锁
+     */
+    Node<K, V> *current = _header;
+    Node<K, V> *update[_max_level + 1];
+    std::fill_n(update, _max_level + 1, nullptr);
+    for (int i = _skip_list_level; i >= 0; --i) {
+        while (current->forward[i] && current->forward[i]->get_key() < key) {
+            current = current->forward[i];
+        }
+        update[i] = current;
+    }
+    current = current->forward[0];
+    if (current && current->get_key() == key) {
+        for (int i = 0; i <= _skip_list_level; ++i) {
+            if (update[i]->forward[i] != current) {
+                break;
+            }
+            update[i]->forward[i] = current->forward[i];
+        }
+        while (_skip_list_level > 0 && _header->forward[_skip_list_level] == nullptr) {
+            --_skip_list_level;
+        }
+        delete current;
+        --_element_count;
+        return true;
+    }
+    return false;
+}
+
+template <typename K, typename V> bool SkipList<K, V>::erase(const K &key) {
+    std::unique_lock<std::shared_mutex> lock(mtx_);
+    return erase_unlocked(key);
+}
+
+template <typename K, typename V>
+std::vector<std::pair<K, V>> SkipList<K, V>::scan(const K &start_key, const K &end_key) const {
+    /**
+     * @brief 范围查询
+     * @param start_key：范围的起始键，包含在范围内
+     * @param end_key：范围的结束键，不包含在范围内
+     * @return std::vector<std::pair<K, V>>：包含左闭右开范围内所有键值对的向量
+     * @details 从跳表中查找所有键在 [start_key, end_key) 范围内的元素，并返回它们的键值对。
+     * @note 读取方法，用共享锁
+     */
+    std::shared_lock lock(mtx_);
+    std::vector<std::pair<K, V>> result;
+    Node<K, V> *current = _header;
+    for (int i = _skip_list_level; i >= 0; --i) {
+        while (current->forward[i] && current->forward[i]->get_key() < start_key) {
+            current = current->forward[i];
+        }
+    }
+    current = current->forward[0];
+    // 到达第 0 层，current->forward[0] 是第 0 层上第一个键大于或等于 start_key 的节点。
+    while (current && current->get_key() < end_key) {
+        if (current->get_key() >= start_key) {
+            result.emplace_back(current->get_key(), current->get_value());
+        }
+        current = current->forward[0];
+    }
+    return result;
+}
+
+template <typename K, typename V>
+bool SkipList<K, V>::checkpoint() {
+    /**
+     * @brief 创建跳表的检查点
+     * @return bool：如果检查点创建成功返回 true，否则返回 false
+     * @details 通过调用 dump_file 方法将跳表中的数据持久化到文件中，创建一个检查点。
+     * @note 目前的实现是全量持久化，如果在 dump 之前或过程中发生崩溃，则所有数据都会丢失。后续改进可以使用 WAL 日志来实现增量持久化，减少数据丢失的风险。
+     */
+    // 检查约束条件，确保当前 SkipList 的键值类型支持持久化。
+    static_assert(is_persistence_supported_v<K, V>, "Current key-value types do not support persistence in checkpoint.");
+    // 将当前跳表的状态持久化到文件中，创建检查点。需要写锁，即独占锁，确保在创建检查点时跳表不会被修改，保持数据一致性。
+    std::unique_lock<std::shared_mutex> lock(mtx_);
+    // 创建检查点，通过调用 dump_file 方法将跳表中的数据持久化到文件中。
+    // 如果 dump_file 成功完成，则返回 true；如果发生异常或者失败，则返回 false。
+    try {
+        dump_file_unlocked();
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "Checkpoint failed: " << e.what() << '\n';
+        return false;
+    }
+}
+
+template <typename K, typename V>
+bool SkipList<K, V>::recover() {
+    /**
+     * @brief 从检查点恢复跳表
+     * @return bool：如果恢复成功返回 true，否则返回 false
+     * @details 通过调用 load_file 方法从持久化文件中加载数据，恢复跳表的状态。
+     * @note 目前的实现是全量恢复，如果在 load_file 之前或过程中发生崩溃，则无法恢复数据。后续改进可以使用 WAL 日志来实现增量恢复，减少数据丢失的风险。
+     */
+    // 检查约束条件，确保当前 SkipList 的键值类型支持持久化。
+    static_assert(is_persistence_supported_v<K, V>, "Current key-value types do not support persistence in recover.");
+    std::unique_lock<std::shared_mutex> lock(mtx_);
+    // 从检查点恢复，通过调用 load_file 方法从持久化文件中加载数据，恢复跳表的状态。
+    // 如果 load_file 成功完成，则返回 true；如果发生异常或者失败，则返回 false。
+    try {
+        load_file_unlocked();
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "Recovery failed: " << e.what() << '\n';
+        return false;
+    }
+}
+
+template <typename K, typename V>
+WriteResult SkipList<K, V>::put_unlocked(const K &key, const V &value, bool update_existing) {
+    /**
+     * @brief 插入或更新键值对
+     * @param key：要插入或更新的键
+     * @param value：要插入或更新的值
+     * @return WriteResult：表示写入结果的枚举值，可能是 Inserted、Updated 或 Failed
+     * @details 如果键不存在，则插入新的键值对并返回 Inserted；如果键已存在，则更新其值并返回 Updated；如果发生错误，则返回 Failed。
+     */
+    Node<K, V> *current = _header;
+    Node<K, V> *update[_max_level + 1];
+    std::fill_n(update, _max_level + 1, nullptr);
+    for (int i = _skip_list_level; i >= 0; --i) {
+        while (current->forward[i] && current->forward[i]->get_key() < key) {
+            current = current->forward[i];
+        }
+        update[i] = current;
+    }
+    current = current->forward[0];
+    if (current && current->get_key() == key) {
+        if (update_existing) {
+            current->set_value(value);
+        }
+        return WriteResult::updated;
+    }
+
+    int random_level = get_random_level();
+    if (random_level > _skip_list_level) {
+        for (int i = _skip_list_level + 1; i <= random_level; ++i) {
+            update[i] = _header;
+        }
+        _skip_list_level = random_level;
+    }
+    Node<K, V>* new_node = create_node(key, value, random_level);
+    for (int i = 0; i <= random_level; ++i) {
+        new_node->forward[i] = update[i]->forward[i];
+        update[i]->forward[i] = new_node;
+    }
+    ++_element_count;
+    return WriteResult::inserted;
+}
+
+template <typename K, typename V>
+WriteResult SkipList<K, V>::put(const K &key, const V &value) {
+    std::unique_lock<std::shared_mutex> lock(mtx_);
+    return put_unlocked(key, value, true);
+}
+
+template <typename K, typename V>
+void SkipList<K, V>::dump_file_unlocked() {
+    _file_writer.open(_store_file);
+    Node<K, V> *node = this->_header->forward[0];
+    while (node != nullptr) {
+        _file_writer << node->get_key() << ":" << node->get_value() << "\n";
+        node = node->forward[0];
+    }
+    _file_writer.flush();
+    _file_writer.close();
+}
+
+template <typename K, typename V>
+void SkipList<K, V>::load_file_unlocked() {
+    _file_reader.open(_store_file);
+    std::string line;
+    std::string key;
+    std::string value;
+    while (getline(_file_reader, line)) {
+        key.clear();
+        value.clear();
+        get_key_value_from_string(line, &key, &value);
+        if (key.empty() || value.empty()) {
+            continue;
+        }
+        put_unlocked(stoi(key), value, false);
+    }
+    _file_reader.close();
+}
+
 } // namespace skiplist
