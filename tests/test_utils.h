@@ -7,6 +7,7 @@
 #include <string>
 
 inline constexpr const char* kDumpFilePath = "store/dumpFile";
+inline constexpr const char* kSnapshotHeader = "SKIPLIST_SNAPSHOT_V1";
 
 class TestFailureException : public std::runtime_error {
 public:
@@ -28,8 +29,8 @@ public:
 
 #define EXPECT_EQ(lhs, rhs)                                                      \
     do {                                                                         \
-        const auto& _lhs = (lhs);                                                \
-        const auto& _rhs = (rhs);                                                \
+        const auto _lhs = (lhs);                                                 \
+        const auto _rhs = (rhs);                                                 \
         if (!(_lhs == _rhs)) {                                                   \
             std::ostringstream oss;                                              \
             oss << "EXPECT_EQ failed: " << #lhs << " != " << #rhs << " ("        \
@@ -43,6 +44,10 @@ inline void reset_dump_file() {
     std::ofstream dump_file(kDumpFilePath, std::ios::trunc);
     if (!dump_file.is_open()) {
         throw TestFailureException("failed to reset dump file");
+    }
+    dump_file << kSnapshotHeader << '\n';
+    if (!dump_file) {
+        throw TestFailureException("failed to write empty snapshot header");
     }
 }
 

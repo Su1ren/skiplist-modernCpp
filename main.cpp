@@ -6,41 +6,53 @@
 > Description:   
  ************************************************************************/
 #include <iostream>
+#include <string>
+#include <utility>
+#include <vector>
+
 #include "skiplist.h"
-#define FILE_PATH "./store/dumpFile"
+
 using namespace skiplist;
 
 int main() {
+    SkipListOptions options(6);
+    options.enable_wal = true;
+    options.sync_wal = true;
 
-    // 键值中的key用int型，如果用其他类型，需要自定义比较函数
-    // 而且如果修改key的类型，同时需要修改skipList.load_file函数
-    SkipList<int, std::string> skipList(6);
-    skipList.put(1, "刘备");
-    skipList.put(3, "关羽");
-    skipList.put(7, "张飞");
-    skipList.put(8, "赵云");
-    skipList.put(9, "诸葛亮");
-    skipList.put(19, "晋");
-    skipList.put(19, "司马懿");
+    SkipList<int, std::string> primary(options);
+    primary.put(1, "刘备");
+    primary.put(3, "关羽");
+    primary.put(7, "张飞");
+    primary.put(8, "赵云");
+    primary.put(9, "诸葛亮");
 
-    const SkipList<int, std::string>& read_view = skipList;
+    if (const auto value = primary.get(9); value.has_value()) {
+        std::cout << "get(9): " << value.value() << '\n';
+    }
 
-    std::cout << "skipList size:" << read_view.size() << '\n';
+    const std::vector<std::pair<int, std::string>> scan_result = primary.scan(3, 10);
+    std::cout << "scan[3, 10):";
+    for (const auto& [key, value] : scan_result) {
+        std::cout << ' ' << key << '=' << value;
+    }
+    std::cout << '\n';
 
-    skipList.dump_file();
+    if (!primary.checkpoint()) {
+        std::cerr << "checkpoint failed\n";
+        return 1;
+    }
 
-    // skipList.load_file();
+    primary.put(9, "司马懿");
+    primary.put(11, "曹操");
+    primary.erase(3);
 
-    std::cout << "contains 9: " << read_view.contains(9) << '\n';
-    std::cout << "contains 18: " << read_view.contains(18) << '\n';
+    SkipList<int, std::string> recovered(options);
+    if (!recovered.recover()) {
+        std::cerr << "recover failed\n";
+        return 1;
+    }
 
-
-    skipList.display_list();
-
-    skipList.erase(3);
-    skipList.erase(7);
-
-    std::cout << "skipList size:" << read_view.size() << '\n';
-
-    skipList.display_list();
+    std::cout << "recovered size: " << recovered.size() << '\n';
+    recovered.display_list();
+    return 0;
 }

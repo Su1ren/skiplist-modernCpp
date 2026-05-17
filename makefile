@@ -6,17 +6,20 @@ STRESS_BIN = ./bin/stress
 STRESS_ARGS ?=
 
 skiplist: main.o
+	mkdir -p ./bin
 	$(CXX) -o $(MAIN_BIN) main.o $(CXXFLAGS)
 	rm -f ./*.o
 
 test: tests/test_main.cpp tests/test_utils.h skiplist.h
+	mkdir -p ./bin
 	$(CXX) tests/test_main.cpp -o $(TEST_BIN) $(CXXFLAGS)
 	$(TEST_BIN)
 	rm -f ./*.o
 
 stress: stress-test/stress_test.cpp skiplist.h
+	mkdir -p ./bin
 	$(CXX) stress-test/stress_test.cpp -o $(STRESS_BIN) $(CXXFLAGS)
 	$(STRESS_BIN) $(STRESS_ARGS)
 
 clean:
-	rm -f ./*.o $(TEST_BIN) $(STRESS_BIN)
+	rm -f ./*.o $(MAIN_BIN) $(TEST_BIN) $(STRESS_BIN)

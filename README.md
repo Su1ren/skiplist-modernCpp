@@ -1,99 +1,121 @@
-👉 本项目为C++实现，想系统学习本项目，推荐 [卡码网【kv存储引擎-CPP】实战课](https://kamacoder.com/course.php?course_id=8)
-👉 想了解Java版本，推荐 [卡码网【kv存储引擎-Java】实战课](https://kamacoder.com/course.php?course_id=9)
-
-> 版权申明： 本项目为我（[程序员Carl](https://github.com/youngyangyang04)）的原创。引用本项目文章请注明出处，例如：转自 https://github.com/youngyangyang04/Skiplist-CPP。
-> 发现恶意抄袭或搬运，会动用法律武器维护自己的权益。让我们一起维护一个良好的技术创作环境！
-
-
 # [English Version](./README-en.md)
 
-# KV存储引擎
+# KV 存储引擎
 
-众所周知，非关系型数据库redis，以及levedb，rockdb其核心存储引擎的数据结构就是跳表。
+这是一个基于跳表实现的轻量级 KV 存储引擎，当前定位是“可讲工程取舍的教学型组件”，不是完整数据库。
 
-本项目就是基于跳表实现的轻量级键值型存储引擎，使用C++实现。插入数据、删除数据、查询数据、数据展示、数据落盘、文件加载数据，以及数据库大小显示。
+当前代码基线已经包含：
 
-在随机写读情况下，该项目每秒可处理啊请求数（QPS）: 24.39w，每秒可处理读请求数（QPS）: 18.41w
+* C++17 header-only 跳表实现
+* 新主接口：`put / get / contains / erase / scan / checkpoint / recover`
+* 兼容旧接口：`insert_element / search_element / delete_element / dump_file / load_file`
+* 全表级读写锁并发模型
+* `snapshot + WAL` 基础恢复链路
+* 参数化 benchmark harness
 
-# 项目中文件
+## 当前持久化模型
 
-* main.cpp 包含skiplist.h使用跳表进行数据操作
-* skiplist.h 跳表核心实现
-* README.md 中文介绍    
-* README-en.md 英文介绍       
-* bin 生成可执行文件目录 
-* makefile 编译脚本
-* store 数据落盘的文件存放在这个文件夹 
-* stress_test_start.sh 压力测试脚本
-* LICENSE 使用协议
+当前落地的是 P1 级基础恢复能力：
 
-# 提供接口
+* Snapshot 格式
+  * 第一行：`SKIPLIST_SNAPSHOT_V1`
+  * 后续每行：`<key>\t<escaped_value>`
+* WAL 格式
+  * `P\t<key>\t<escaped_value>`
+  * `D\t<key>`
+* `recover()` 顺序
+  * 先加载 snapshot
+  * 再顺序回放 WAL
+* `checkpoint()` 语义
+  * 生成新 snapshot
+  * 清空旧 WAL
 
-* insertElement（插入数据）
-* deleteElement（删除数据）
-* searchElement（查询数据）
-* displayList（展示已存数据）
-* dumpFile（数据落盘）
-* loadFile（加载数据）
-* size（返回数据规模）
+当前边界也需要明确：
 
+* 持久化只支持 `K=int, V=std::string`
+* 这是基础可恢复版，不是生产级 crash consistency
+* 还没有 SSTable、compaction、Bloom Filter、checksum、损坏修复
 
-# 存储引擎数据表现
+## 项目结构
 
-## 插入操作
+* `skiplist.h`
+  * 跳表核心实现
+* `main.cpp`
+  * 演示 `put / get / scan / checkpoint / recover`
+* `tests/test_main.cpp`
+  * 轻量回归测试入口
+* `stress-test/stress_test.cpp`
+  * benchmark harness
+* `stress_test_start.sh`
+  * benchmark 构建与运行脚本
+* `store/`
+  * 默认 snapshot/WAL 目录
+* `bin/`
+  * 生成的可执行文件
 
-跳表树高：18 
+## 主接口
 
-采用随机插入数据测试：
+* `WriteResult put(const K&, const V&)`
+* `std::optional<V> get(const K&) const`
+* `bool contains(const K&) const`
+* `bool erase(const K&)`
+* `std::vector<std::pair<K, V>> scan(const K&, const K&) const`
+* `size_t size() const`
+* `bool checkpoint()`
+* `bool recover()`
 
+## 构建与测试
 
-|插入数据规模（万条） |耗时（秒） | 
-|---|---|
-|10 |0.316763 |
-|50 |1.86778 |
-|100 |4.10648 |
-
-
-每秒可处理写请求数（QPS）: 24.39w
-
-## 取数据操作
-
-|取数据规模（万条） |耗时（秒） | 
-|---|---|
-|10|0.47148 |10|
-|50|2.56373 |50|
-|100|5.43204 |100|
-
-每秒可处理读请求数（QPS）: 18.41w
-
-# 项目运行方式
-
-```
-make            // complie demo main.cpp
-./bin/main      // run 
-```
-
-如果想自己写程序使用这个kv存储引擎，只需要在你的CPP文件中include skiplist.h 就可以了。
-
-可以运行如下脚本测试kv存储引擎的性能（当然你可以根据自己的需求进行修改）
-
-```
-sh stress_test_start.sh 
+```bash
+make
+./bin/main
 ```
 
-# 待优化 
+```bash
+make test
+```
 
-* delete的时候没有释放内存 （我这里进行了优化，更改SkipList析构函数的代码，使得析构完全，还请各路大佬来指正）
-* 压力测试并不是全自动的
-* 跳表的key用int型，如果使用其他类型需要自定义比较函数，当然把这块抽象出来更好
-* 如果再加上一致性协议，例如raft就构成了分布式存储，再启动一个http server就可以对外提供分布式存储服务了
+```bash
+sh stress_test_start.sh
+```
 
-# 原始作者
+也可以给 benchmark 传参，例如：
 
-程序员Carl，[《代码随想录》](https://programmercarl.com/other/publish.html)作者，哈工大师兄，先后在腾讯和百度从事分布式技术研发。
+```bash
+sh stress_test_start.sh --threads=4 --ops=100000 --workload=mixed --sync-wal=false
+```
 
-* [代码随想录网站](https://programmercarl.com)
-* [代码随想录Github](https://github.com/youngyangyang04/leetcode-master)
-* [代码随想录算法公开课](https://www.bilibili.com/video/BV1fA4y1o715)
+## Demo 行为
 
+当前 `main.cpp` 会演示下面这条链路：
 
+1. `put`
+2. `get`
+3. `scan`
+4. `checkpoint`
+5. checkpoint 后继续写入
+6. 新实例 `recover`
+
+## 当前测试覆盖
+
+回归测试已经覆盖：
+
+* 基础增删查与旧接口兼容
+* `scan` 有序性
+* snapshot round-trip
+* WAL 写入顺序与失败路径
+* WAL-only recover
+* snapshot + WAL recover
+* `checkpoint` 后清空 WAL
+* 非法 snapshot / 非法 WAL 返回失败
+* 并发 smoke test
+
+## 后续方向
+
+如果继续往数据库方向演进，下一阶段通常会是：
+
+* `MemTable + Immutable MemTable + SSTable`
+* 后台 flush
+* compaction
+* checksum 与损坏检测
+* 更完整的自动化测试和 CI

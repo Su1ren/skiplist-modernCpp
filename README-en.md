@@ -1,77 +1,119 @@
 # Skiplist-CPP
 
- A tiny KV storage based on skiplist written in C++ language
+A lightweight KV engine based on a skip list. The current goal of this repository is a small, explainable storage component rather than a full database.
 
-# interface
+Current baseline:
 
-* insertElement
-* deleteElement 
-* searchElement
-* displayList
-* dumpFile 
-* loadFile
-* size
+* C++17 header-only skip list implementation
+* Main APIs: `put / get / contains / erase / scan / checkpoint / recover`
+* Compatibility APIs: `insert_element / search_element / delete_element / dump_file / load_file`
+* Table-level read/write lock concurrency model
+* Basic `snapshot + WAL` recovery path
+* Parameterized benchmark harness
 
-# performance data  
+## Persistence Model
 
-## insert
+The repository currently implements a P1-level basic recovery model:
 
-skiplist tree high:18
-insert random key
+* Snapshot format
+  * Header: `SKIPLIST_SNAPSHOT_V1`
+  * Records: `<key>\t<escaped_value>`
+* WAL format
+  * `P\t<key>\t<escaped_value>`
+  * `D\t<key>`
+* `recover()` order
+  * load snapshot first
+  * replay WAL next
+* `checkpoint()` semantics
+  * write a new snapshot
+  * truncate the old WAL
 
-|insert element num (w) | timecost (s)  |
-|---|---|
-|10 |0.316763 |
-|50 |1.86778 |
-|100 |4.10648 |
+Current boundaries:
 
-qps: 24.39w
+* Persistence is only supported for `K=int, V=std::string`
+* Recovery is basic and not production-grade crash consistency
+* There is still no SSTable, compaction, Bloom filter, checksum, or corruption repair
 
-## get
+## Project Layout
 
-|search element (w) |timecost (s) |skiplist size (w)|
-|---|---| --- |
-|10|0.47148 |10|
-|50|2.56373 |50|
-|100|5.43204 |100|
+* `skiplist.h`
+  * core skip list implementation
+* `main.cpp`
+  * demo for `put / get / scan / checkpoint / recover`
+* `tests/test_main.cpp`
+  * lightweight regression test runner
+* `stress-test/stress_test.cpp`
+  * benchmark harness
+* `stress_test_start.sh`
+  * benchmark build/run entry
+* `store/`
+  * default snapshot/WAL directory
+* `bin/`
+  * generated executables
 
-qps:18.41w
+## Public APIs
 
+* `WriteResult put(const K&, const V&)`
+* `std::optional<V> get(const K&) const`
+* `bool contains(const K&) const`
+* `bool erase(const K&)`
+* `std::vector<std::pair<K, V>> scan(const K&, const K&) const`
+* `size_t size() const`
+* `bool checkpoint()`
+* `bool recover()`
 
-# code coverage report 
+## Build and Test
 
-gtest and  lcov
-
-[](file:///Users/sunxiuyang/Downloads/tmp/result/home/users/sunxiuyang/workspace/baidu/personal-code/sunxiuyang/index.html)
-
-how to getcoverage report  
-
+```bash
+make
+./bin/main
 ```
-lcov -d . -t 'skiplist_test' -o 'skiplist_test.info' -b . -c  
 
-genhtml -o result skiplist_test.info
+```bash
+make test
 ```
 
-# USAGE
-
-Just include skiplist.h in your code
-
-```
-make            // complie demo main.cpp
-./bin/main      // run 
+```bash
+sh stress_test_start.sh
 ```
 
-Test performance data 
+Example benchmark command:
 
+```bash
+sh stress_test_start.sh --threads=4 --ops=100000 --workload=mixed --sync-wal=false
 ```
-sh stress_test_start.sh 
-```
 
+## Demo Flow
 
-# Todo 
+`main.cpp` now demonstrates:
 
-* stress test is not auto
+1. `put`
+2. `get`
+3. `scan`
+4. `checkpoint`
+5. more writes after checkpoint
+6. recovery in a fresh instance
 
-# License
+## Test Coverage
 
-This library is licensed under GPL-3.0 License. See LICENSE for details.
+The current regression suite covers:
+
+* base CRUD behavior and compatibility APIs
+* ordered `scan`
+* snapshot round-trip
+* WAL append ordering and failure paths
+* WAL-only recover
+* snapshot + WAL recover
+* WAL truncation after checkpoint
+* invalid snapshot / invalid WAL failure cases
+* concurrency smoke tests
+
+## Next Steps
+
+Likely next milestones if the project keeps moving toward a database design:
+
+* `MemTable + Immutable MemTable + SSTable`
+* background flush
+* compaction
+* checksum and corruption detection
+* fuller automated tests and CI

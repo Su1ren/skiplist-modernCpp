@@ -7,6 +7,7 @@
  ************************************************************************/
 #pragma once
 
+#include <algorithm>
 #include <iostream> 
 #include <cstdlib>
 #include <cmath>
@@ -18,8 +19,12 @@
 #include <memory>
 #include <shared_mutex>
 #include <cassert>
+#include <stdexcept>
 #include <type_traits>
 #include <cstdint>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cerrno>
 
 // #define STORE_FILE "store/dumpFile" // 定义持久化文件路径
 
@@ -200,20 +205,50 @@ private:
     bool erase_unlocked(const K &key);
     void dump_file_unlocked();
     void load_file_unlocked();
-    void get_key_value_from_string(const std::string& str, std::string* key, std::string* value); // 从字符串中提取键值对
-    bool is_valid_string(const std::string& str); // 判断字符串是否有效，是否包含键值对分隔符
+
+    bool append_wal_line_unlocked(const std::string &line);
+    bool append_put_wal_unlocked(const K& key, const V& value);
+    bool append_delete_wal_unlocked(const K &key);
+
+    bool replay_wal_unlocked();
 
 private:
-    // 定义键值对分隔符，静态常量成员，所有 SkipList 实例共享同一个分隔符
-    static constexpr const char* delimiter = ":";
+    // 定义快照文件的头部标识，用于验证文件格式和版本，确保在加载数据时能够正确识别和解析文件内容。
+    static constexpr const char *kSnapshotHeader = "SKIPLIST_SNAPSHOT_V1";
+    // 定义字段分隔符，使用制表符 '\t' 作为键值对之间的分隔符，避免与键值中的常见字符冲突，提高数据解析的可靠性。
+    static constexpr char kFieldSep = '\t';
+    // 定义 WAL 日志中表示插入或更新操作的标识符，使用 'P' 来区分不同类型的操作，便于在日志中记录和解析写入操作。
+    static constexpr char kWalPutOp = 'P';
+    // 定义 WAL 日志中表示删除操作的标识符，使用 'D' 来区分不同类型的操作，便于在日志中记录和解析删除操作。
+    static constexpr char kWalDeleteOp = 'D';
 
     // 定义转义函数，用于处理键值对中可能包含的分隔符，避免在解析时出现问题
-    std::string escape_value(const std::string &value);
+    static std::string escape_value(const std::string &value);
     // 定义反转义函数，用于将转义后的字符串还原为原始值，确保在加载数据时能够正确解析出键值对。
-    std::string unescape_value(const std::string &value);
+    // 通过返回 bool 判断是否转义失败。若失败，则记录 recover() == false，并在日志中输出错误信息，便于后续排查问题。
+    static bool unescape_value(const std::string &escaped, std::string *unescaped);
+    // 解析字符串中的整数键，返回解析结果
+    static bool parse_int_key(const std::string &str, int *key);
+    // 按行编码 snapshot 文件内容，返回编码后的字符串
+    static std::string encode_snapshot_line(int key, const std::string& line);
+    // 按行解码 snapshot 文件内容，返回解析是否成功，并通过参数返回解析出的键值对
+    static bool decode_snapshot_line(const std::string &line, int *key, std::string *value);
 
+    // 编码 WAL 日志 put 记录，返回编码后的字符串
+    static std::string encode_wal_put_record(int key, const std::string &value);
+    // 编码 WAL 日志 delete 记录，返回编码后的字符串
+    static std::string encode_wal_delete_record(int key);
+    // 解码 WAL 日志记录，返回解析是否成功，并通过参数返回解析出的操作类型、键和值
+    static bool
+    decode_wal_record(const std::string &line, char *op_type, int *key, std::string *value);
+    
     // 删除所有节点，替代原始的 clear 函数，避免递归删除导致的栈溢出问题。
     void clear_all_nodes();
+    // 删除数据节点，保留头节点，适用于 load_file_unlocked 之前清空旧数据的场景。
+    void clear_data_nodes_unlocked();
+
+    bool _enable_wal; // 是否启用 WAL 日志
+    bool _sync_wal;   // 是否在每次写入 WAL 日志后立即同步到磁盘
     
     // Maximum level of the skip list
     // 跳表的最大层数，决定了跳表的高度和性能。
@@ -297,7 +332,19 @@ int SkipList<K, V>::insert_element(const K key, const V value) {
      */
 
     std::unique_lock<std::shared_mutex> lock(mtx_);
-    return put_unlocked(key, value, false) == WriteResult::inserted ? 0 : 1;
+    // 先查重
+    if (get_unlocked(key).has_value()) {
+        return 1; // 元素已存在
+    }
+    // 如果启用 WAL 日志，则在插入之前记录插入操作到 WAL 日志中，以便在发生崩溃时能够通过 WAL 日志进行恢复。
+    if (_enable_wal) {
+        if (!append_put_wal_unlocked(key, value)) {
+            throw std::runtime_error("failed to append WAL record for key: " + std::to_string(key));
+        }
+    }
+    // 最后调用 put_unlocked 执行插入操作，传入 update_existing = false，表示这是一个插入操作，不会更新已有元素。
+    put_unlocked(key, value, false);
+    return 0; // 插入成功
 }
 
 // Display skip list
@@ -325,9 +372,8 @@ template <typename K, typename V> void SkipList<K, V>::display_list(std::ostream
 template <typename K, typename V> void SkipList<K, V>::dump_file() {
     /**
      * @brief 持久化跳表内容到文件，快照式持久化
-     * @details 将跳表中的所有元素写入到指定的文件中，格式为 "key:value"，每个键值对占一行。
-     * @note 每次调用 dump 进行全量持久化。而且在 dump 之前或过程中发生崩溃，则所有数据都会丢失，后续改进可以使用 WAL 日志来实现增量持久化，减少数据丢失的风险。
-     * @note 当前持久化数据格式比较脆弱，如果 value 中包含了分隔符 ":"，则在加载数据时会出现问题，后续改进可以使用更健壮的序列化方式来存储数据，例如 JSON 或者 Protocol Buffers。
+     * @details 第一行固定写入 snapshot header，后续每行使用 "<key>\t<escaped_value>" 格式。
+     * @note 当前仍是全量 snapshot，不包含 WAL 回放逻辑。
      */
     // 检查约束条件，确保当前 SkipList 的键值类型支持持久化。
     static_assert(is_persistence_supported_v<K, V>, "Current key-value types do not support persistence in dump_file.");
@@ -354,40 +400,6 @@ template <typename K, typename V> void SkipList<K, V>::load_file() {
 template<typename K, typename V> 
 int SkipList<K, V>::size() { 
     return static_cast<int>(static_cast<const SkipList<K, V>&>(*this).size());
-}
-
-template <typename K, typename V>
-void SkipList<K, V>::get_key_value_from_string(const std::string &str,
-                                               std::string *key,
-                                               std::string *value) {
-    /**
-     * @brief 根据字符串解析出键值对
-     * @param str：待解析的字符串
-     * @param key：存储解析出的键
-     * @param value：存储解析出的值
-     */
-
-    if(!is_valid_string(str)) {
-        return;
-    }
-    *key = str.substr(0, str.find(delimiter));
-    *value = str.substr(str.find(delimiter) + 1, str.length());
-}
-
-template<typename K, typename V>
-bool SkipList<K, V>::is_valid_string(const std::string& str) {
-    /**
-     * @brief 判断是否是一个有效的键值对字符串
-     * @param str：待判断的字符串
-     * @return bool：如果字符串非空且包含分隔符，则返回 true；否则返回 false
-     */
-    if (str.empty()) {
-        return false;
-    }
-    if (str.find(delimiter) == std::string::npos) {
-        return false;
-    }
-    return true;
 }
 
 // Delete element from skip list
@@ -443,6 +455,8 @@ SkipList<K, V>::SkipList(const SkipListOptions& options) {
     this->_element_count = 0;
     this->_store_file = options.store_file;
     this->_wal_file = options.wal_path;
+    this->_enable_wal = options.enable_wal;
+    this->_sync_wal = options.sync_wal;
     assert(!this->_store_file.empty());
 
     // create header node and initialize key and value to null
@@ -518,6 +532,19 @@ void SkipList<K, V>::clear_all_nodes() {
     delete _header;
 }
 
+template <typename K, typename V>
+void SkipList<K, V>::clear_data_nodes_unlocked() {
+    Node<K, V>* current = _header->forward[0];
+    while (current) {
+        Node<K, V>* next = current->forward[0];
+        delete current;
+        current = next;
+    }
+    std::fill_n(_header->forward, _max_level + 1, nullptr);
+    _skip_list_level = 0;
+    _element_count = 0;
+}
+
 template<typename K, typename V>
 int SkipList<K, V>::get_random_level() {
 
@@ -541,37 +568,67 @@ int SkipList<K, V>::get_random_level() {
 template<typename K, typename V>
 std::string SkipList<K, V>::escape_value(const std::string &value) {
     /**
-     * @brief 转义字符串中的分隔符
+     * @brief 转义所有分隔符和特殊字符
      * @param value：待转义的字符串
      * @return 转义后的字符串
-     * @details 将字符串中的分隔符 ":" 替换为 "\:"，以避免在解析键值对时出现问题。
+     * @details 将所有转义字符（如反斜杠、制表符、换行符等）进行转义，确保在存储和解析过程中不会被误解为分隔符或其他特殊字符。
      */
-    std::string escaped_value = value;
-    size_t pos = 0;
-    std::string escaped_delimiter = std::string("\\") + delimiter;
-    while ((pos = escaped_value.find(delimiter, pos)) != std::string::npos) {
-        escaped_value.replace(pos, 1, escaped_delimiter);
-        pos += escaped_delimiter.length(); // 跳过转义后的分隔符
+    std::string res;
+    res.reserve(value.size() * 2); // 预分配足够的空间，避免频繁 realloc
+    for (char c : value) {
+        switch (c) {
+            case '\\':
+                res += "\\\\"; // 转义反斜杠
+                break;
+            case '\t':
+                res += "\\t"; // 转义制表符
+                break;
+            case '\n':
+                res += "\\n"; // 转义换行符
+                break;
+            default:
+                res.push_back(c); // 其他字符直接添加
+                break;
+        }
     }
-    return escaped_value;
+    return res;
 }
 
 template<typename K, typename V>
-std::string SkipList<K, V>::unescape_value(const std::string &value) {
+bool SkipList<K, V>::unescape_value(const std::string &value, std::string *unescaped) {
     /**
      * @brief 反转义字符串中的分隔符
      * @param value：待反转义的字符串
-     * @return 反转义后的字符串
-     * @details 将字符串中的转义分隔符 "\:" 替换回 ":"，以还原原始值。
+     * @param unescaped：存储反转义后字符串的指针
+     * @return bool：如果反转义成功返回 true，否则返回 false
+     * @details 将字符串中的转义序列（如 "\\t"、"\\n"、"\\\\" 等）还原为原始字符，确保在加载数据时能够正确解析出键值对。
      */
-    std::string unescaped_value = value;
-    size_t pos = 0;
-    std::string escaped_delimiter = std::string("\\") + delimiter;
-    while ((pos = unescaped_value.find(escaped_delimiter, pos)) != std::string::npos) {
-        unescaped_value.replace(pos, escaped_delimiter.length(), delimiter);
-        pos += std::string(delimiter).length(); // 跳过分隔符
+    unescaped->clear();
+    unescaped->reserve(value.size()); // 预分配足够的空间，避免频繁 realloc
+    for (size_t i = 0; i < value.size(); ++i) {
+        if (value[i] == '\\') {
+            if (i + 1 >= value.size()) {
+                return false; // 转义字符后面没有字符，反转义失败
+            }
+            switch (value[i + 1]) {
+                case 't':
+                    unescaped->push_back('\t');
+                    break;
+                case 'n':
+                    unescaped->push_back('\n');
+                    break;
+                case '\\':
+                    unescaped->push_back('\\');
+                    break;
+                default:
+                    return false; // 未知的转义序列，反转义失败
+            }
+            ++i; // 跳过转义字符
+        } else {
+            unescaped->push_back(value[i]);
+        }
     }
-    return unescaped_value;
+    return true;
 }
 
 template <typename K, typename V>
@@ -663,6 +720,16 @@ template <typename K, typename V> bool SkipList<K, V>::erase_unlocked(const K &k
 
 template <typename K, typename V> bool SkipList<K, V>::erase(const K &key) {
     std::unique_lock<std::shared_mutex> lock(mtx_);
+    // 检查是否存在 key，如果不存在则直接返回 false，避免不必要的删除操作和锁竞争。
+    if (!get_unlocked(key).has_value()) {
+        return false;
+    }
+    // 如果启用 WAL 日志，则在删除之前记录删除操作到 WAL 日志中，以便在发生崩溃时能够通过 WAL 日志进行恢复。
+    if (_enable_wal) {
+        if (!append_delete_wal_unlocked(key)) {
+            return false; // 如果记录 WAL 日志失败，则返回 false，避免执行删除操作导致数据不一致。
+        }
+    }
     return erase_unlocked(key);
 }
 
@@ -700,8 +767,8 @@ bool SkipList<K, V>::checkpoint() {
     /**
      * @brief 创建跳表的检查点
      * @return bool：如果检查点创建成功返回 true，否则返回 false
-     * @details 通过调用 dump_file 方法将跳表中的数据持久化到文件中，创建一个检查点。
-     * @note 目前的实现是全量持久化，如果在 dump 之前或过程中发生崩溃，则所有数据都会丢失。后续改进可以使用 WAL 日志来实现增量持久化，减少数据丢失的风险。
+     * @details snapshot 写完并同步后，清空旧的 WAL 文件，新的恢复起点变为“snapshot + 空 WAL”。
+     * @note checkpoint 完成后，新的恢复起点为 snapshot + 空 WAL。
      */
     // 检查约束条件，确保当前 SkipList 的键值类型支持持久化。
     static_assert(is_persistence_supported_v<K, V>, "Current key-value types do not support persistence in checkpoint.");
@@ -711,6 +778,33 @@ bool SkipList<K, V>::checkpoint() {
     // 如果 dump_file 成功完成，则返回 true；如果发生异常或者失败，则返回 false。
     try {
         dump_file_unlocked();
+        // 确保 snapshot 的数据已经完全写入磁盘，避免在后续清空 WAL 文件后，发生崩溃导致恢复失败。
+        const int snapshot_fd = ::open(_store_file.c_str(), O_WRONLY);
+        if (snapshot_fd == -1) {
+            throw std::runtime_error("failed to reopen snapshot file for fsync: " + _store_file);
+        }
+        if (::fsync(snapshot_fd) == -1) {
+            ::close(snapshot_fd);
+            throw std::runtime_error("failed to fsync snapshot file: " + _store_file);
+        }
+        if (::close(snapshot_fd) == -1) {
+            throw std::runtime_error("failed to close snapshot file after fsync: " + _store_file);
+        }
+        // 清空旧的 WAL 文件，确保新的恢复起点为 snapshot + 空 WAL。
+        // 通过以 O_TRUNC 模式打开 WAL 文件来清空其内容。
+        const int wal_fd = ::open(_wal_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (wal_fd == -1) {
+            throw std::runtime_error("failed to truncate WAL file: " + _wal_file);
+        }
+        // 确保 WAL 文件的内容已经完全清空并写入磁盘，避免在后续发生崩溃导致恢复失败。
+        if (::fsync(wal_fd) == -1) {
+            ::close(wal_fd);
+            throw std::runtime_error("failed to fsync truncated WAL file: " + _wal_file);
+        }
+        if (::close(wal_fd) == -1) {
+            throw std::runtime_error("failed to close truncated WAL file: " + _wal_file);
+        }
+
         return true;
     } catch (const std::exception& e) {
         std::cerr << "Checkpoint failed: " << e.what() << '\n';
@@ -724,15 +818,27 @@ bool SkipList<K, V>::recover() {
      * @brief 从检查点恢复跳表
      * @return bool：如果恢复成功返回 true，否则返回 false
      * @details 通过调用 load_file 方法从持久化文件中加载数据，恢复跳表的状态。
-     * @note 目前的实现是全量恢复，如果在 load_file 之前或过程中发生崩溃，则无法恢复数据。后续改进可以使用 WAL 日志来实现增量恢复，减少数据丢失的风险。
+     * @note 先清空跳表节点，保留头节点。若 snapshot 存在则先加载 snapshot，再在 WAL 存在时顺序回放 WAL。
      */
     // 检查约束条件，确保当前 SkipList 的键值类型支持持久化。
     static_assert(is_persistence_supported_v<K, V>, "Current key-value types do not support persistence in recover.");
     std::unique_lock<std::shared_mutex> lock(mtx_);
-    // 从检查点恢复，通过调用 load_file 方法从持久化文件中加载数据，恢复跳表的状态。
-    // 如果 load_file 成功完成，则返回 true；如果发生异常或者失败，则返回 false。
     try {
-        load_file_unlocked();
+        clear_data_nodes_unlocked();
+
+        std::ifstream snapshot_file(_store_file);
+        if (snapshot_file.good()) {
+            load_file_unlocked();
+        }
+        snapshot_file.close();
+
+        std::ifstream wal_file(_wal_file);
+        // 如果 WAL 文件存在且可读，则回放 WAL 日志以恢复数据。若回放失败，则返回 false，表示恢复失败。
+        if (wal_file.good() && !replay_wal_unlocked()) {
+            wal_file.close();
+            return false;
+        }
+        wal_file.close();
         return true;
     } catch (const std::exception& e) {
         std::cerr << "Recovery failed: " << e.what() << '\n';
@@ -782,40 +888,272 @@ WriteResult SkipList<K, V>::put_unlocked(const K &key, const V &value, bool upda
     return WriteResult::inserted;
 }
 
-template <typename K, typename V>
-WriteResult SkipList<K, V>::put(const K &key, const V &value) {
+template <typename K, typename V> WriteResult SkipList<K, V>::put(const K &key, const V &value) {
+    /**
+     * @brief 插入或更新键值对
+     * @param key：要插入或更新的键
+     * @param value：要插入或更新的值
+     * @return WriteResult：表示写入结果的枚举值，可能是 Inserted、Updated 或 Failed
+     * @details 如果键不存在，则插入新的键值对并返回 Inserted；如果键已存在，则更新其值并返回 Updated；如果发生错误，则返回 Failed。
+     * @note 先追加 WAL，若 sync_wal = true，则执行 flush + fsync 确保数据写入磁盘，然后再修改内存中的跳表结构。这样即使在修改内存之前发生崩溃，也能通过 WAL 恢复数据，保证数据的持久性和一致性。
+     */
     std::unique_lock<std::shared_mutex> lock(mtx_);
+    // 先追加 WAL，确保数据持久化
+    if (_enable_wal) {
+        // 永远使用 put 操作的 WAL 记录格式，即使是更新操作，也使用 put 记录，这样在恢复时不需要区分插入和更新，简化恢复逻辑。
+        if (!append_put_wal_unlocked(key, value)) {
+            throw std::runtime_error("failed to append WAL record for key: " + std::to_string(key));
+        }
+    }
     return put_unlocked(key, value, true);
 }
 
 template <typename K, typename V>
 void SkipList<K, V>::dump_file_unlocked() {
-    _file_writer.open(_store_file);
+    _file_writer.open(_store_file, std::ios::out | std::ios::trunc);
+    if (!_file_writer.is_open()) {
+        throw std::runtime_error("failed to open snapshot file for writing: " + _store_file);
+    }
+
+    _file_writer << kSnapshotHeader << '\n';
     Node<K, V> *node = this->_header->forward[0];
     while (node != nullptr) {
-        _file_writer << node->get_key() << ":" << node->get_value() << "\n";
+        _file_writer << encode_snapshot_line(node->get_key(), node->get_value()) << '\n';
         node = node->forward[0];
     }
+
     _file_writer.flush();
+    if (!_file_writer) {
+        _file_writer.close();
+        throw std::runtime_error("failed to flush snapshot file: " + _store_file);
+    }
     _file_writer.close();
 }
 
 template <typename K, typename V>
 void SkipList<K, V>::load_file_unlocked() {
     _file_reader.open(_store_file);
+    if (!_file_reader.is_open()) {
+        return;
+    }
+
     std::string line;
-    std::string key;
-    std::string value;
-    while (getline(_file_reader, line)) {
-        key.clear();
-        value.clear();
-        get_key_value_from_string(line, &key, &value);
-        if (key.empty() || value.empty()) {
-            continue;
+    if (!std::getline(_file_reader, line) || line != kSnapshotHeader) {
+        _file_reader.close();
+        throw std::runtime_error("invalid snapshot header in: " + _store_file);
+    }
+
+    while (std::getline(_file_reader, line)) {
+        int key = 0;
+        std::string escaped_value;
+        std::string value;
+
+        if (!decode_snapshot_line(line, &key, &escaped_value)) {
+            _file_reader.close();
+            throw std::runtime_error("invalid snapshot record in: " + _store_file);
         }
-        put_unlocked(stoi(key), value, false);
+        if (!unescape_value(escaped_value, &value)) {
+            _file_reader.close();
+            throw std::runtime_error("invalid escaped snapshot value in: " + _store_file);
+        }
+        put_unlocked(key, value, false);
     }
     _file_reader.close();
+}
+
+template <>
+bool SkipList<int, std::string>::parse_int_key(const std::string &str, int *key) {
+    if (str.empty()) {
+        return false;
+    }
+
+    try {
+        std::size_t parsed = 0;
+        const int value = std::stoi(str, &parsed);
+        if (parsed != str.size()) {
+            return false;
+        }
+        *key = value;
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+template <>
+std::string SkipList<int, std::string>::encode_snapshot_line(int key, const std::string &value) {
+    return std::to_string(key) + kFieldSep + escape_value(value);
+}
+
+template <>
+bool SkipList<int, std::string>::decode_snapshot_line(const std::string &line,
+                                                      int *key,
+                                                      std::string *value) {
+    /**
+     * @brief 解码 snapshot 文件中的一行内容，提取键值对
+     * @param line：待解码的字符串行，格式为 "key\tvalue"
+     * @param key：存储解析出的键的指针
+     * @param value：存储解析出的值的指针
+     * @return bool：如果解码成功返回 true，否则返回 false
+     * @details 解析字符串中的整数键和字符串值，确保正确处理分隔符和转义字符，提取出原始的键值对。
+     */
+    const std::size_t pos = line.find(kFieldSep);
+    if (pos == std::string::npos) {
+        return false;
+    }
+    if (!parse_int_key(line.substr(0, pos), key)) {
+        return false;
+    }
+    *value = line.substr(pos + 1);
+    return true;
+}
+
+template <>
+std::string SkipList<int, std::string>::encode_wal_put_record(int key, const std::string &value) {
+    std::string record;
+    record.push_back(kWalPutOp);
+    record.push_back(kFieldSep);
+    record += std::to_string(key);
+    record.push_back(kFieldSep);
+    record += escape_value(value);
+    return record;
+}
+
+template <>
+std::string SkipList<int, std::string>::encode_wal_delete_record(int key) {
+    std::string record;
+    record.push_back(kWalDeleteOp);
+    record.push_back(kFieldSep);
+    record += std::to_string(key);
+    return record;
+}
+
+template <>
+bool SkipList<int, std::string>::decode_wal_record(const std::string &line, char *op_type, int *key, std::string *value) {
+    if (line.size() < 3 || line[1] != kFieldSep) {
+        return false;
+    }
+
+    *op_type = line[0];
+    if (*op_type == kWalDeleteOp) {
+        value->clear();
+        return parse_int_key(line.substr(2), key);
+    }
+
+    if (*op_type != kWalPutOp) {
+        return false;
+    }
+
+    const std::size_t pos = line.find(kFieldSep, 2);
+    if (pos == std::string::npos) {
+        return false;
+    }
+    if (!parse_int_key(line.substr(2, pos - 2), key)) {
+        return false;
+    }
+    *value = line.substr(pos + 1);
+    return true;
+}
+
+template <> bool SkipList<int, std::string>::append_wal_line_unlocked(const std::string &line) {
+    /**
+     * @brief 追加 WAL 日志记录，按行追加到 WAL 文件中
+     * @param line：要追加的 WAL 日志记录，格式为 "op_type\tkey\tvalue" 或 "op_type\tkey"
+     * @return bool：如果追加成功返回 true，否则返回 false
+     */
+
+    const std::string record = line + '\n';
+    const int fd = ::open(_wal_file.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+
+    // 使用 RAII 原则管理文件描述符，确保在函数退出时能够正确关闭文件，避免资源泄漏。
+    if (fd == -1) {
+        return false;
+    }
+    size_t total_written = 0;
+    while (total_written < record.size()) {
+        const ssize_t written = ::write(fd, record.data() + total_written, record.size() - total_written);
+        if (written == -1) {
+            if (errno == EINTR) {
+                continue; // 如果写入被信号中断，继续尝试写入
+            }
+            // 最终失败，关闭文件描述符并返回 false
+            ::close(fd);
+            return false;
+        }
+        total_written += static_cast<size_t>(written);
+    }
+    // 写入完毕，如果 sync_wal 配置为 true，则执行 fsync 确保数据写入磁盘，增强数据的持久性。
+    if (_sync_wal && ::fsync(fd) == -1) {
+        // 若 fsync 失败，关闭文件描述符并返回 false
+        ::close(fd);
+        return false;
+    }
+    // 关闭文件描述符并返回 true，表示追加成功
+    return ::close(fd) == 0;
+}
+
+template <typename K, typename V>
+bool SkipList<K, V>::append_put_wal_unlocked(const K &key, const V &value) {
+    /**
+     * @brief 追加 WAL 日志记录，按行追加到 WAL 文件中
+     * @param key：要追加的键
+     * @param value：要追加的值
+     * @return bool：如果追加成功返回 true，否则返回 false。
+     * @details 即为对应的 put 操作生成 WAL 日志记录，格式为 "P\tkey\tvalue"，并调用 append_wal_line_unlocked 方法将日志记录追加到 WAL 文件中。
+     */
+    return append_wal_line_unlocked(encode_wal_put_record(key, value));
+}
+
+template <typename K, typename V>
+bool SkipList<K, V>::append_delete_wal_unlocked(const K &key) {
+    /**
+     * @brief 追加 WAL 日志记录，按行追加到 WAL 文件中
+     * @param key：要追加的键
+     * @return bool：如果追加成功返回 true，否则返回 false。
+     * @details 即为对应的 delete 操作生成 WAL 日志记录，格式为 "D\tkey"，并调用 append_wal_line_unlocked 方法将日志记录追加到 WAL 文件中。
+     */
+    return append_wal_line_unlocked(encode_wal_delete_record(key));
+}
+
+template <typename K, typename V>
+bool SkipList<K, V>::replay_wal_unlocked() {
+    /**
+     * @brief 回放 WAL 日志，恢复数据
+     * @return bool：如果回放成功返回 true，否则返回 false
+     * @details 从 WAL 文件中逐行读取日志记录，解析每条记录的操作类型、键和值，并根据操作类型执行相应的插入或删除操作来恢复数据。
+     */
+    std::ifstream wal_file(_wal_file);
+    if (!wal_file.is_open()) {
+        return false;
+    }
+
+    std::string line;
+    while (std::getline(wal_file, line)) {
+        char op_type;
+        int key;
+        std::string escaped_value;
+
+        if (!decode_wal_record(line, &op_type, &key, &escaped_value)) {
+            wal_file.close();
+            return false; // 如果解析 WAL 记录失败，则返回 false，表示回放失败。
+        }
+        if (op_type == kWalPutOp) {
+            std::string value;
+            // 需要对原始 WAL 记录中的转义值进行反转义，恢复出原始的值。如果反转义失败，则返回 false，表示回放失败。
+            if (!unescape_value(escaped_value, &value)) {
+                wal_file.close();
+                return false;
+            }
+            put_unlocked(key, value, true);
+        } else if (op_type == kWalDeleteOp) {
+            erase_unlocked(key);
+        } else {
+            wal_file.close();
+            return false; // 如果遇到未知的 WAL 操作类型，则返回 false，表示回放失败。
+        }
+    }
+    wal_file.close();
+    return true;
 }
 
 } // namespace skiplist
